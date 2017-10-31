@@ -1,6 +1,8 @@
 # olap
 易观olap大赛
 
+
+易观目前使用Presto实现，通过自定义UDAF实现有序漏斗转化，请参考AggregationLDCount.java和AggregationLDSum.java实现，大赛测试用例实现如下：
 1、查询2017年1月份，时间窗口为7天，事件顺序为10001、10004、10008的漏斗，结果为[3999974, 3995900, 3608934]，21s
 SELECT ld_sum(xwho_state, 3)
 FROM (SELECT ld_count(xwhen, 7 * 86400000, xwhat_id, '10001,10004,10008') AS xwho_state
