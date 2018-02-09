@@ -1,0 +1,413 @@
+From 02075e1e1cbc023787d6f01f524d472f552ca051 Mon Sep 17 00:00:00 2001
+From: flow <flowbehappy@gmail.com>
+Date: Sun, 17 Sep 2017 15:49:46 +0800
+Subject: [PATCH] Add AggregateFunctionPath
+
+---
+ dbms/CMakeLists.txt                                |   2 +
+ .../AggregateFunctions/AggregateFunctionPath.cpp   |  32 +++
+ .../src/AggregateFunctions/AggregateFunctionPath.h | 249 +++++++++++++++++++++
+ .../registerAggregateFunctions.cpp                 |   2 +
+ .../Storages/MergeTree/MergedBlockOutputStream.cpp |   8 +-
+ .../Storages/MergeTree/MergedBlockOutputStream.h   |   8 +-
+ 6 files changed, 296 insertions(+), 5 deletions(-)
+ create mode 100644 dbms/src/AggregateFunctions/AggregateFunctionPath.cpp
+ create mode 100644 dbms/src/AggregateFunctions/AggregateFunctionPath.h
+
+diff --git a/dbms/CMakeLists.txt b/dbms/CMakeLists.txt
+index 0dcf288..e3cbbe9 100644
+--- a/dbms/CMakeLists.txt
++++ b/dbms/CMakeLists.txt
+@@ -177,6 +177,7 @@ target_link_libraries (dbms
+     ${Boost_SYSTEM_LIBRARY}
+     ${Poco_Data_LIBRARY}
+     btrie
++    daemon
+ )
+ 
+ if (Poco_DataODBC_FOUND)
+@@ -212,6 +213,7 @@ target_include_directories (dbms PUBLIC ${MYSQLXX_INCLUDE_DIR})
+ target_include_directories (dbms PRIVATE ${POCOEXT_INCLUDE_DIR})
+ target_include_directories (dbms PRIVATE ${COMMON_INCLUDE_DIR})
+ target_include_directories (dbms PUBLIC ${DBMS_INCLUDE_DIR})
++target_include_directories (dbms PUBLIC ${ClickHouse_SOURCE_DIR}/libs/libdaemon/include)
+ 
+ if (ENABLE_TESTS)
+     add_subdirectory (tests)
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionPath.cpp b/dbms/src/AggregateFunctions/AggregateFunctionPath.cpp
+new file mode 100644
+index 0000000..c3387f8
+--- /dev/null
++++ b/dbms/src/AggregateFunctions/AggregateFunctionPath.cpp
+@@ -0,0 +1,32 @@
++#include <AggregateFunctions/AggregateFunctionFactory.h>
++#include <AggregateFunctions/AggregateFunctionPath.h>
++#include <AggregateFunctions/Helpers.h>
++
++namespace DB
++{
++
++namespace
++{
++
++AggregateFunctionPtr createAggregateFunctionPath(const std::string & name, const DataTypes & argument_types, const Array & params)
++{
++
++    if (params.size() <= 0 || params.size() > 32)
++        throw Exception("Aggregate function " + name + " requires (1, 32] event ids.", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++    AggregateFunctionPtr res(createWithNumericType<AggregateFunctionPath>(*argument_types[1]));
++
++    if (!res)
++        throw Exception("Illegal type " + argument_types[1]->getName() + " of argument 2 for aggregate function " + name, ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
++
++    return res;
++}
++
++}
++
++void registerAggregateFunctionPath(AggregateFunctionFactory & factory)
++{
++    factory.registerFunction("path", createAggregateFunctionPath, AggregateFunctionFactory::CaseInsensitive);
++}
++
++}
+diff --git a/dbms/src/AggregateFunctions/AggregateFunctionPath.h b/dbms/src/AggregateFunctions/AggregateFunctionPath.h
+new file mode 100644
+index 0000000..14d9265
+--- /dev/null
++++ b/dbms/src/AggregateFunctions/AggregateFunctionPath.h
+@@ -0,0 +1,249 @@
++#pragma once
++
++#include <unordered_set>
++#include <IO/ReadHelpers.h>
++#include <IO/WriteHelpers.h>
++#include <common/logger_useful.h>
++
++#include <Common/ArenaAllocator.h>
++
++#include <Columns/ColumnsNumber.h>
++#include <DataTypes/DataTypesNumber.h>
++
++#include <AggregateFunctions/IBinaryAggregateFunction.h>
++
++
++namespace DB
++{
++struct ComparePairFirst final
++{
++    template <typename T1, typename T2>
++    bool operator()(const std::pair<T1, T2> & lhs, const std::pair<T1, T2> & rhs) const
++    {
++        return lhs.first < rhs.first;
++    }
++};
++
++struct AggregateFunctionPathData final
++{
++    using Allocator = MixedArenaAllocator<4096>;
++    using TimestampEvent = std::pair<UInt64, UInt16>;
++    using TimestampEvents = PODArray<TimestampEvent, 32, Allocator>;
++    using Comparator = ComparePairFirst;
++
++    bool done = false;
++    UInt32 level = 0;
++
++    bool sorted = true;
++    TimestampEvents timestamp_events;
++
++    void add(UInt64 timestamp, UInt16 event, Arena * arena)
++    {
++        if (done)
++            throw Exception("This group is done! Looks like you forgot to correctly manage your data among nodes");
++
++        // Since most events should have already been sorted by timestamp.
++        if (sorted && timestamp_events.size() > 0 && timestamp_events.back().first > timestamp)
++            sorted = false;
++        timestamp_events.push_back(std::make_pair(timestamp, event), arena);
++    }
++
++    void merge(const AggregateFunctionPathData & other, Arena * arena)
++    {
++        done = done || other.done;
++        level = std::max(level, other.level);
++        if (done)
++            return;
++
++        const auto size = timestamp_events.size();
++
++        timestamp_events.insert(std::begin(other.timestamp_events), std::end(other.timestamp_events), arena);
++
++        /// either sort whole container or do so partially merging ranges afterwards
++        if (!sorted && !other.sorted)
++            std::sort(std::begin(timestamp_events), std::end(timestamp_events), Comparator{});
++        else
++        {
++            const auto begin = std::begin(timestamp_events);
++            const auto middle = std::next(begin, size);
++            const auto end = std::end(timestamp_events);
++
++            if (!sorted)
++                std::sort(begin, middle, Comparator{});
++
++            if (!other.sorted)
++                std::sort(middle, end, Comparator{});
++
++            std::inplace_merge(begin, middle, end, Comparator{});
++        }
++
++        sorted = true;
++    }
++
++    void sort()
++    {
++        if (!sorted)
++        {
++            std::sort(std::begin(timestamp_events), std::end(timestamp_events), Comparator{});
++            sorted = true;
++        }
++    }
++};
++
++
++template <typename T>
++class AggregateFunctionPath final : public IBinaryAggregateFunction<AggregateFunctionPathData, AggregateFunctionPath<T>>
++{
++private:
++    using Events = UInt16[32];
++
++    UInt64 window;
++    Events check_events;
++    size_t check_events_size;
++
++    // return the index + 1 of event
++    inline size_t findEventLevel(UInt16 event) const
++    {
++        for (size_t i = 0; i < check_events_size; i++)
++        {
++            if (event == check_events[i])
++            {
++                return i + 1;
++            }
++        }
++        return 0xFFFF;
++    }
++
++    UInt32 match(const AggregateFunctionPathData & data) const
++    {
++        if (data.done)
++            return data.level;
++
++        if (check_events_size == 1)
++            return 1;
++
++        const_cast<AggregateFunctionPathData &>(data).sort();
++
++        auto total_len = data.timestamp_events.size();
++        size_t max_level = 0;
++        for (size_t i = total_len; i > 0; i--)
++        {
++            auto event = (data.timestamp_events)[i - 1].second;
++            auto event_level = findEventLevel(event);
++            if (event_level <= max_level)
++                continue;
++
++            if (search(data, i, event_level))
++            {
++                max_level = event_level;
++                if (max_level == check_events_size)
++                    break;
++            }
++        }
++
++        return max_level;
++    }
++
++
++    inline bool search(const AggregateFunctionPathData & data, size_t end_event_pos, size_t end_event_level) const
++    {
++        if (end_event_level == 1)
++        {
++            return true;
++        }
++        auto edge_time = (data.timestamp_events)[end_event_pos - 1].first - window;
++        auto event_level = end_event_level;
++        for (size_t i = end_event_pos; i > 0; i--)
++        {
++            auto time_event = (data.timestamp_events)[i - 1];
++            if (time_event.first < edge_time)
++                return false;
++            if (check_events[event_level - 1] == time_event.second)
++            {
++                event_level--;
++                if (event_level == 0)
++                    return true;
++            }
++        }
++        return false;
++    }
++
++public:
++    String getName() const override
++    {
++        return "path";
++    }
++
++    DataTypePtr getReturnType() const override
++    {
++        return std::make_shared<DataTypeUInt8>();
++    }
++
++    void setParameters(const Array & params) override
++    {
++        if (params.size() <= 1 || params.size() > 33)
++            throw Exception("Aggregate function " + getName() + " requires (windows_in_seconds, 1_to_32_event_ids).",
++                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
++
++        // Only support up to seconds in param, and timestamp is in milliseconds
++        window = params[0].safeGet<UInt64>() * 1000;
++
++        check_events_size = params.size() - 1;
++        for (size_t i = 1; i < params.size(); i++)
++        {
++            UInt64 p = params[i].safeGet<UInt64>();
++            check_events[i - 1] = (UInt16)p;
++        }
++    }
++
++    void setArgumentsImpl(const DataTypes & arguments)
++    {
++        DataTypePtr timestampType = arguments[0];
++        DataTypePtr eventType = arguments[1];
++
++        if (!(timestampType->getName() == "UInt64"))
++            throw Exception("Illegal type " + timestampType->getName() + " of argument for aggregate function " + getName()
++                    + " (1 arg, timestamp: UInt64)",
++                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
++        if (!(eventType->isNumeric()))
++            throw Exception(
++                "Illegal type " + eventType->getName() + " of argument for aggregate function " + getName() + " (2 arg, event id: numeric)",
++                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
++    }
++
++    void addImpl(
++        AggregateDataPtr place, const IColumn & column_timestamp, const IColumn & column_event, size_t row_num, Arena * arena) const
++    {
++        this->data(place).add( //
++            static_cast<const ColumnVector<UInt64> &>(column_timestamp).getData()[row_num],
++            static_cast<const ColumnVector<T> &>(column_event).getData()[row_num],
++            arena);
++    }
++
++    void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena * arena) const override
++    {
++        this->data(place).merge(this->data(rhs), arena);
++    }
++
++    void serialize(ConstAggregateDataPtr place, WriteBuffer & buf) const override
++    {
++        writeVarUInt(match(this->data(place)), buf);
++    }
++
++    void deserialize(AggregateDataPtr place, ReadBuffer & buf, Arena *) const override
++    {
++        readVarUInt(this->data(place).level, buf);
++        this->data(place).done = true;
++    }
++
++    void insertResultInto(ConstAggregateDataPtr place, IColumn & to) const override
++    {
++        static_cast<ColumnUInt8 &>(to).getData().push_back(match(this->data(place)));
++    }
++
++    bool allocatesMemoryInArena() const override
++    {
++        return true;
++    }
++};
++}
+diff --git a/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp b/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
+index 5c8646f..f055e18 100644
+--- a/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
++++ b/dbms/src/AggregateFunctions/registerAggregateFunctions.cpp
+@@ -5,6 +5,7 @@
+ namespace DB
+ {
+ 
++void registerAggregateFunctionPath(AggregateFunctionFactory & factory);
+ void registerAggregateFunctionAvg(AggregateFunctionFactory & factory);
+ void registerAggregateFunctionCount(AggregateFunctionFactory & factory);
+ void registerAggregateFunctionGroupArray(AggregateFunctionFactory & factory);
+@@ -30,6 +31,7 @@ void registerAggregateFunctions()
+ {
+     auto & factory = AggregateFunctionFactory::instance();
+ 
++    registerAggregateFunctionPath(factory);
+     registerAggregateFunctionAvg(factory);
+     registerAggregateFunctionCount(factory);
+     registerAggregateFunctionGroupArray(factory);
+diff --git a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
+index 4936cd8..6e0b05f 100644
+--- a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
++++ b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.cpp
+@@ -37,7 +37,7 @@ IMergedBlockOutputStream::IMergedBlockOutputStream(
+     min_compress_block_size(min_compress_block_size_),
+     max_compress_block_size(max_compress_block_size_),
+     aio_threshold(aio_threshold_),
+-    compression_method(compression_method_)
++    _compression_method(compression_method_)
+ {
+ }
+ 
+@@ -69,7 +69,7 @@ void IMergedBlockOutputStream::addStream(
+             path + escaped_column_name, NULL_MAP_EXTENSION,
+             path + escaped_column_name, NULL_MARKS_FILE_EXTENSION,
+             max_compress_block_size,
+-            compression_method,
++            compression_method(name),
+             estimated_size,
+             aio_threshold);
+ 
+@@ -91,7 +91,7 @@ void IMergedBlockOutputStream::addStream(
+                 path + escaped_size_name, DATA_FILE_EXTENSION,
+                 path + escaped_size_name, MARKS_FILE_EXTENSION,
+                 max_compress_block_size,
+-                compression_method,
++                compression_method(name),
+                 estimated_size,
+                 aio_threshold);
+         }
+@@ -105,7 +105,7 @@ void IMergedBlockOutputStream::addStream(
+             path + escaped_column_name, DATA_FILE_EXTENSION,
+             path + escaped_column_name, MARKS_FILE_EXTENSION,
+             max_compress_block_size,
+-            compression_method,
++            compression_method(name),
+             estimated_size,
+             aio_threshold);
+     }
+diff --git a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
+index 92a0dda..2749980 100644
+--- a/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
++++ b/dbms/src/Storages/MergeTree/MergedBlockOutputStream.h
+@@ -81,9 +81,15 @@ protected:
+ 
+     size_t aio_threshold;
+ 
+-    CompressionMethod compression_method;
++    CompressionMethod compression_method(const String & name){
++        if(endsWith(name, "_nc")){
++            return CompressionMethod::NONE;
++        }
++        return _compression_method;
++    }
+ 
+ private:
++    CompressionMethod _compression_method;
+     /// Internal version of writeData.
+     void writeDataImpl(const String & name, const IDataType & type, const IColumn & column,
+         OffsetColumns & offset_columns, size_t level, bool write_array_data, bool skip_offsets);
+-- 
+2.10.1 (Apple Git-78)
+
